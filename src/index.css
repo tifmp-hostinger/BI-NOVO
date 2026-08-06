@@ -1,0 +1,225 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------
+   FMP Design System — overrides built on fmp-tokens.css
+   Outfit (sans) + Noto Serif (display, italic)
+   ------------------------------------------------------------------ */
+
+@layer base {
+  html {
+    font-family: 'Outfit', ui-sans-serif, system-ui, -apple-system, 'Segoe UI',
+      sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: var(--fmp-cream);
+    color: var(--fmp-black);
+    line-height: 1.55;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    line-height: 1.2;
+  }
+
+  ::selection {
+    background-color: var(--fmp-red-100);
+    color: var(--fmp-black);
+  }
+
+  /* Scrollbar — discretely on-brand */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--fmp-line); border-radius: 999px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--fmp-sand); }
+}
+
+@layer components {
+  /* ---- Editorial title (hero / page heading) ---- */
+  .fmp-display {
+    font-family: 'Noto Serif', Georgia, serif;
+    font-style: italic;
+    font-weight: 500;
+    line-height: 1.04;
+    letter-spacing: -.01em;
+    color: var(--fmp-black);
+  }
+
+  /* ---- KPI value in Noto Serif italic ---- */
+  .fmp-kpi {
+    font-family: 'Noto Serif', Georgia, serif;
+    font-style: italic;
+    font-weight: 600;
+    line-height: 1;
+    color: var(--fmp-black);
+  }
+
+  /* ---- Eyebrow / overline ---- */
+  .fmp-eyebrow {
+    font-family: 'Outfit', sans-serif;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .16em;
+    color: var(--fmp-red);
+  }
+
+  /* ---- Card surface ---- */
+  .fmp-card {
+    background: var(--fmp-white);
+    border: 1px solid var(--fmp-line);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
+  }
+
+  /* ---- Hairline divider ---- */
+  .fmp-hairline { border-color: var(--fmp-line); }
+
+  /* ---- Buttons ---- */
+  .fmp-btn-primary {
+    background: var(--fmp-red);
+    color: var(--fmp-white);
+    border: none;
+    border-radius: var(--radius-pill);
+    transition: background var(--dur-fast) var(--ease-out),
+      transform var(--dur-fast) var(--ease-out);
+  }
+  .fmp-btn-primary:hover { background: var(--fmp-red-hover); }
+  .fmp-btn-primary:active { background: var(--fmp-red-press); }
+
+  .fmp-btn-secondary {
+    background: transparent;
+    color: var(--fmp-black);
+    border: 1px solid var(--fmp-line-2);
+    border-radius: var(--radius-pill);
+    transition: border-color var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out);
+  }
+  .fmp-btn-secondary:hover { border-color: var(--fmp-red); color: var(--fmp-red); }
+
+  /* ---- Links de conteudo (ver nota em fmp-tokens.css) ---- */
+  a:not(.no-underline) {
+    color: var(--fmp-black);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    text-decoration-color: var(--fmp-red);
+  }
+  a:not(.no-underline):hover { color: var(--fmp-red); }
+
+  /* ---- Dark nav surface ---- */
+  .fmp-nav {
+    background: var(--fmp-dark-2);
+    color: var(--fmp-on-dark);
+  }
+
+  /* ---- Wash for selected row/section ---- */
+  .fmp-wash-red { background: var(--fmp-red-tint); }
+  .fmp-selected-line { background: var(--fmp-red-100); }
+
+  /* ---- Glass (legacy compat — kept minimal) ---- */
+  .glass {
+    background: rgba(255, 255, 255, 0.7);
+    backdrop-filter: blur(16px) saturate(160%);
+    -webkit-backdrop-filter: blur(16px) saturate(160%);
+    border: 1px solid var(--fmp-line);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .glass-header {
+    background: rgba(239, 238, 234, 0.85);
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+    border-bottom: 1px solid var(--fmp-line);
+  }
+
+  .glass-drawer {
+    background: var(--fmp-dark-2);
+    backdrop-filter: none;
+    border-right: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .glass-input {
+    background: rgba(255, 255, 255, 0.6);
+    border: 1px solid var(--fmp-line);
+    transition: border-color var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out);
+  }
+  .glass-input:focus-within {
+    border-color: var(--fmp-red);
+    box-shadow: 0 0 0 3px var(--fmp-red-tint);
+  }
+
+  .glass-button {
+    background: var(--fmp-white);
+    border: 1px solid var(--fmp-line);
+    transition: border-color var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out);
+  }
+  .glass-button:hover {
+    border-color: var(--fmp-red);
+    color: var(--fmp-red);
+  }
+
+  .glass-dropdown {
+    background: var(--fmp-white);
+    border: 1px solid var(--fmp-line);
+    box-shadow: var(--shadow-lg);
+  }
+
+  /* Hero now uses the dark editorial surface */
+  .hero-gradient {
+    background: var(--fmp-dark-2);
+  }
+
+  .glass-fab {
+    background: var(--fmp-red);
+    color: var(--fmp-white);
+    border: none;
+    box-shadow: var(--shadow-md);
+    transition: transform var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out);
+  }
+  .glass-fab:hover {
+    background: var(--fmp-red-hover);
+    transform: translateY(-2px);
+  }
+}
+
+/* ---- Leaflet ---- */
+.leaflet-container {
+  font-family: 'Outfit', sans-serif;
+  border-radius: var(--radius-md);
+  background: var(--fmp-cream);
+}
+
+.leaflet-tile-pane { filter: saturate(0.9) brightness(1.02); }
+
+.leaflet-tooltip.cep-tooltip {
+  background: var(--fmp-white);
+  border: 1px solid var(--fmp-line);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-sm);
+  font-family: 'Outfit', sans-serif;
+  padding: 8px 10px;
+}
+.leaflet-tooltip.cep-tooltip::before { display: none; }
+
+.leaflet-control-attribution {
+  background: rgba(255,255,255,0.75) !important;
+  border-radius: var(--radius-sm) !important;
+  font-size: 10px !important;
+  color: var(--fmp-ink-3) !important;
+  padding: 2px 6px !important;
+}
+
+.leaflet-control-zoom a {
+  background: var(--fmp-white) !important;
+  color: var(--fmp-black) !important;
+  border: 1px solid var(--fmp-line) !important;
+}
+.leaflet-control-zoom a:hover {
+  border-color: var(--fmp-red) !important;
+  color: var(--fmp-red) !important;
+}

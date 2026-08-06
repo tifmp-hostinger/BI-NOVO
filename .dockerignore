@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.bolt
+
+# Um .env presente no contexto de build entraria na imagem pelo `COPY . .` e o
+# Vite o carregaria durante `npm run build`, sobrescrevendo em silencio os
+# valores passados como build arg. A configuracao de producao vem de build args
+# e do /config.js gerado no boot -- nunca de um arquivo local.
+.env
+.env.*
+!.env.example
