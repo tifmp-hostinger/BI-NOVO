@@ -314,14 +314,23 @@ function validaEvidencias(
 
 // ------------------------------------------------------------------ LLM
 
+/**
+ * Orçamento de saída generoso de propósito.
+ *
+ * Nos modelos da linha gpt-5 o raciocínio interno consome o MESMO orçamento da
+ * resposta. Com um teto apertado, o modelo gasta tudo pensando e devolve
+ * conteúdo vazio com `finish_reason: 'length'` — que aparece como "resposta
+ * vazia", não como "faltou espaço".
+ */
+const TETO_SAIDA = 8000;
+
 async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknown>> {
-  const corpo = {
+  const base: Record<string, unknown> = {
     messages: mensagens,
     tools: FERRAMENTAS,
     tool_choice: 'auto',
-    temperature: 0.2,
-    max_tokens: 2000,
   };
+  let corpo: Record<string, unknown>;
 
   let url: string;
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -329,10 +338,15 @@ async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknow
   if (AZURE_ENDPOINT && AZURE_KEY && AZURE_DEPLOYMENT) {
     url = `${AZURE_ENDPOINT.replace(/\/$/, '')}/openai/deployments/${AZURE_DEPLOYMENT}/chat/completions?api-version=${AZURE_API_VERSION}`;
     headers['api-key'] = AZURE_KEY;
+    // A API do Azure na versão fixada aqui ainda usa os nomes antigos.
+    corpo = { ...base, max_tokens: TETO_SAIDA, temperature: 0.2 };
   } else if (OPENAI_KEY) {
     url = 'https://api.openai.com/v1/chat/completions';
     headers.Authorization = `Bearer ${OPENAI_KEY}`;
-    (corpo as Record<string, unknown>).model = OPENAI_MODEL;
+    // Os modelos atuais da OpenAI trocaram `max_tokens` por
+    // `max_completion_tokens` e recusam `temperature` fora do padrão —
+    // mandar qualquer um dos dois derruba a chamada com 400.
+    corpo = { ...base, model: OPENAI_MODEL, max_completion_tokens: TETO_SAIDA };
   } else {
     throw new Error('LLM não configurada nesta função.');
   }
@@ -515,6 +529,15 @@ Deno.serve(async (req: Request) => {
 
     if (chamadas.length === 0) {
       textoFinal = msg.content ?? '';
+      // Estouro de orçamento devolve conteúdo vazio. Sem este aviso, a tela
+      // volta sozinha para a escolha de painel como se nada tivesse acontecido
+      // — o usuário clica de novo e cai no mesmo buraco.
+      if (!textoFinal && escolha?.finish_reason === 'length') {
+        return json(
+          { erro: 'O assistente ficou sem espaço para responder. Tente uma pergunta mais curta.' },
+          502,
+        );
+      }
       break;
     }
 

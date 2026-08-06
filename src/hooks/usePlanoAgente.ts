@@ -104,6 +104,17 @@ export function usePlanoAgente() {
           snapshots: mapa,
         });
         setEquipe(await pedidoEquipe);
+        // Sem plano e sem texto, `aplica` deixaria o estado idêntico ao
+        // inicial — e a página cairia de volta na escolha de painel, como se
+        // o clique não tivesse acontecido. Erro explícito é melhor que sumiço.
+        if (!r.plano && !r.resposta) {
+          setEstado((s) => ({
+            ...s,
+            gerando: false,
+            erro: 'O assistente não conseguiu montar um plano deste recorte. Tente de novo.',
+          }));
+          return;
+        }
         aplica(r);
       } catch (err) {
         setEstado((s) => ({
