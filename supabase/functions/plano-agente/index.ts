@@ -339,19 +339,32 @@ async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknow
 
   const resposta = await fetch(url, { method: 'POST', headers, body: JSON.stringify(corpo) });
   if (!resposta.ok) {
-    // NUNCA logar o corpo: pode conter trecho do prompt com dado interno.
-    console.error(`[plano-agente] LLM respondeu ${resposta.status}`);
-    // 400/404 quase sempre e nome de modelo errado ou deployment inexistente.
-    // Sem esta dica o operador ve "nao respondeu" e vai procurar no lugar errado.
+    // Le SO o objeto `error` da resposta -- nunca o corpo que enviamos, que
+    // carrega trecho do snapshot. `error.message` da OpenAI e diagnostico puro
+    // ("The model `x` does not exist") e vale muito mais que "nao respondeu":
+    // sem ele, o operador ve uma tela vermelha e nao sabe se e chave, modelo,
+    // cota ou rede. Cortado em 300 caracteres.
+    let detalhe = '';
+    try {
+      const erroApi = (await resposta.json()) as { error?: { message?: string; code?: string } };
+      detalhe = String(erroApi?.error?.message ?? erroApi?.error?.code ?? '').slice(0, 300);
+    } catch {
+      // resposta sem JSON: segue só com o status
+    }
+    console.error(`[plano-agente] LLM respondeu ${resposta.status}: ${detalhe}`);
+
+    if (resposta.status === 401 || resposta.status === 403) {
+      throw new Error(`A chave da LLM foi recusada (${resposta.status}). Confira o segredo OPENAI_API_KEY. ${detalhe}`);
+    }
     if (resposta.status === 400 || resposta.status === 404) {
       throw new Error(
-        'A LLM recusou a chamada. Confira o segredo OPENAI_MODEL (ou AZURE_OPENAI_DEPLOYMENT) — o nome do modelo provavelmente não existe.',
+        `A LLM recusou a chamada (${resposta.status}). Quase sempre é o nome do modelo — confira OPENAI_MODEL (ou AZURE_OPENAI_DEPLOYMENT). ${detalhe}`,
       );
     }
-    if (resposta.status === 401 || resposta.status === 403) {
-      throw new Error('A chave da LLM foi recusada. Confira o segredo OPENAI_API_KEY.');
+    if (resposta.status === 429) {
+      throw new Error('A LLM está sem cota ou no limite de uso. Confira o saldo da conta.');
     }
-    throw new Error('O assistente não respondeu. Tente de novo em instantes.');
+    throw new Error(`O assistente não respondeu (${resposta.status}). ${detalhe}`);
   }
   return (await resposta.json()) as Record<string, unknown>;
 }
