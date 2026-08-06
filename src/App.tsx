@@ -37,6 +37,9 @@ const MinhaContaPage = lazy(() =>
 const UsuariosPage = lazy(() =>
   import('@/pages/UsuariosPage').then((m) => ({ default: m.UsuariosPage })),
 );
+const PlanoDeAcaoPage = lazy(() =>
+  import('@/pages/PlanoDeAcaoPage').then((m) => ({ default: m.PlanoDeAcaoPage })),
+);
 
 function RouteFallback() {
   return (
@@ -80,6 +83,16 @@ function App() {
                 <ErrorBoundary title="Nao foi possivel exibir esta pagina">
                   <Suspense fallback={<RouteFallback />}>
                     <MinhaContaPage />
+                  </Suspense>
+                </ErrorBoundary>
+              }
+            />
+            <Route
+              path="/plano-de-acao"
+              element={
+                <ErrorBoundary title="Nao foi possivel exibir o Plano de Acao">
+                  <Suspense fallback={<RouteFallback />}>
+                    <PlanoDeAcaoPage />
                   </Suspense>
                 </ErrorBoundary>
               }

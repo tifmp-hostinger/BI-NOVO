@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
   BarChart3,
@@ -15,6 +15,7 @@ import {
   Percent,
   RefreshCw,
   Share2,
+  Sparkles,
   Table as TableIcon,
   Target,
   TrendingUp,
@@ -35,6 +36,7 @@ import { MultiSelect } from '@/components/ui/MultiSelect';
 import { fmtBRLCompact, fmtPct } from '../analise-de-conversao/formatters';
 import { DATA_INICIO_DEFAULT, PRODUTOS, type Produto } from './constants';
 import { useGrowthData } from './hooks/useGrowthData';
+import { buildGrowthSnapshot } from './snapshot';
 import { FunnelPanel } from './components/FunnelPanel';
 import {
   CampanhasView,
@@ -119,6 +121,8 @@ export function GrowthEPerformancePage() {
   // Se a aba ativa não existe no produto atual (Mapa em Cursos Livres),
   // cai no padrão Matrículas em vez de mostrar uma visão vazia.
   const viewAtiva: GrowthView = viewsVisiveis.some((v) => v.id === view) ? view : 'matriculas';
+
+  const navigate = useNavigate();
 
   const filters: GrowthFilters = useMemo(
     () => ({
@@ -228,6 +232,34 @@ export function GrowthEPerformancePage() {
             >
               <Facebook className="h-3.5 w-3.5" />
               Meta
+            </button>
+            {/* Entrada natural do Plano de Acao: leva o recorte que o gestor
+                ja aplicou, em vez de faze-lo reconstruir o contexto na outra
+                tela. Sem isso o modulo vira um item de menu esquecido. */}
+            <button
+              type="button"
+              disabled={loading || !media || !negocio}
+              title="Ler estes numeros e sugerir o que fazer"
+              onClick={() =>
+                navigate('/plano-de-acao', {
+                  state: {
+                    snapshot: buildGrowthSnapshot({
+                      filters,
+                      media,
+                      negocio,
+                      campanhas,
+                      origem,
+                      serieLeads,
+                      serieMatriculas,
+                      freshnessRitmos,
+                    }),
+                  },
+                })
+              }
+              className="inline-flex items-center gap-1.5 rounded-pill border border-fmp bg-white px-3 py-1.5 text-2xs font-semibold text-fmp transition hover:bg-fmp hover:text-white disabled:opacity-40"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              Gerar plano de acao
             </button>
             <button
               type="button"

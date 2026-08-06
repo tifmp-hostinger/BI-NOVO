@@ -253,6 +253,32 @@ export function HomePage() {
             Explorar Presenca Nacional
           </Link>
         </section>
+
+        {/* Plano de Acao: nao e um painel, e o que se faz DEPOIS de ler um. */}
+        <section className="flex flex-col gap-5 rounded-md border border-line bg-white p-6 shadow-card animate-fade-in sm:flex-row sm:items-center">
+          <div className="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-md bg-fmp-muted text-fmp">
+            <Sparkles className="h-6 w-6" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p
+              className="text-lg text-ink"
+              style={{ fontFamily: '"Noto Serif", serif', fontStyle: 'italic', fontWeight: 600 }}
+            >
+              Plano de Acao
+            </p>
+            <p className="mt-1 text-sm leading-relaxed text-ink-3">
+              Leio os numeros de um painel e devolvo o que fazer, com responsavel, prazo e o
+              motivo em portugues claro. Nada e enviado sem voce aprovar.
+            </p>
+          </div>
+          <Link
+            to="/plano-de-acao"
+            className="inline-flex flex-shrink-0 items-center gap-1.5 rounded-pill bg-fmp px-5 py-2.5 text-xs font-semibold text-white transition-all hover:-translate-y-0.5 hover:bg-fmp-dark no-underline"
+          >
+            Comecar
+            <ArrowUpRight className="h-3.5 w-3.5" />
+          </Link>
+        </section>
       </div>
     </AppShell>
   );

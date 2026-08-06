@@ -174,6 +174,51 @@ export function dataBR(iso: string | null | undefined): string | null {
 }
 
 /**
+ * Formata um valor de indicador pela sua unidade, em pt-BR.
+ *
+ * Não reaproveita os `formatters.ts` dos dashboards de propósito: `lib/` é
+ * camada de baixo e não pode depender de `dashboards/` (§3 do SPECS). São dez
+ * linhas de `Intl`, não regra de negócio duplicada.
+ *
+ * Valor ausente vira `—`, nunca `0` nem `NaN` (§11).
+ */
+export function formataIndicador(
+  valor: number | null | undefined,
+  unidade: UnidadeIndicador,
+): string {
+  if (valor === null || valor === undefined || !Number.isFinite(valor)) return '—';
+  switch (unidade) {
+    case 'brl':
+      return valor.toLocaleString('pt-BR', {
+        style: 'currency',
+        currency: 'BRL',
+        maximumFractionDigits: 2,
+      });
+    case 'pct':
+      return `${(valor * 100).toLocaleString('pt-BR', {
+        minimumFractionDigits: 1,
+        maximumFractionDigits: 1,
+      })}%`;
+    case 'ratio':
+      return `${valor.toLocaleString('pt-BR', { maximumFractionDigits: 2 })}×`;
+    case 'horas':
+      return valor === 1 ? '1 hora' : `${valor.toLocaleString('pt-BR')} horas`;
+    case 'int':
+    default:
+      return Math.round(valor).toLocaleString('pt-BR');
+  }
+}
+
+/** "leva ~1 hora" / "leva ~3 dias" — esforço em tempo humano (§7.4). */
+export function formataEsforco(horas: number | null | undefined): string | null {
+  if (horas === null || horas === undefined || !Number.isFinite(horas) || horas <= 0) return null;
+  if (horas < 1.5) return 'leva ~1 hora';
+  if (horas < 8) return `leva ~${Math.round(horas)} horas`;
+  const dias = Math.round(horas / 8);
+  return dias === 1 ? 'leva ~1 dia' : `leva ~${dias} dias`;
+}
+
+/**
  * Tamanho real do snapshot. Usado em desenvolvimento para não estourar o teto
  * sem ninguém perceber — snapshot gordo é conta de token todo dia.
  */

@@ -11,6 +11,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Shield,
+  Sparkles,
   Target,
   TrendingUp,
   UserPlus,
@@ -217,6 +218,30 @@ export function Sidebar({ items, open, onClose, colapsado = false, onToggleColap
               </NavLink>
             );
           })}
+
+          {!colapsado && (
+            <p className="mb-2 mt-5 px-3 text-2xs font-semibold uppercase tracking-widest text-sand/50">
+              Gestao
+            </p>
+          )}
+          <NavLink
+            to="/plano-de-acao"
+            onClick={onClose}
+            title={colapsado ? 'Plano de Acao — Da leitura do painel a acao' : undefined}
+            className={({ isActive }) =>
+              `group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition-all no-underline ${
+                isActive ? 'bg-fmp text-white' : 'text-cream/70 hover:bg-white/10 hover:text-cream'
+              }`
+            }
+          >
+            <Sparkles className="h-4 w-4 flex-shrink-0" strokeWidth={2.3} />
+            {!colapsado && (
+              <div className="min-w-0">
+                <p className="truncate text-sm font-medium">Plano de Acao</p>
+                <p className="truncate text-2xs text-cream/40">Da leitura do painel a acao</p>
+              </div>
+            )}
+          </NavLink>
 
           {!colapsado && (
             <p className="mb-2 mt-5 px-3 text-2xs font-semibold uppercase tracking-widest text-sand/50">
