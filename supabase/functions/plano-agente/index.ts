@@ -3,51 +3,89 @@
  *
  * Um turno de conversa do modulo Plano de Acao.
  *
- * POR QUE ISTO VIVE NO SERVIDOR. A chave da Azure OpenAI nunca pode ir para o
- * navegador: `VITE_*` e embutida no bundle em build-time e `/config.js` e
- * servido publicamente -- os dois caminhos de configuracao do app sao publicos
- * (SPECS 13 e 14). Chave no front = qualquer visitante gastando a cota da FMP.
+ * Segredos (Dashboard -> Edge Functions -> Secrets):
+ *   OPENAI_API_KEY           obrigatorio
+ *   OPENAI_MODEL             opcional; padrao 'gpt-5.6'
+ *   OPENAI_ENVIA_REASONING   opcional; '1' (padrao) ou '0' para modelo sem raciocinio
+ *
+ * NAO existe mais caminho para Azure OpenAI. Ele foi removido de proposito: o
+ * ramo tinha precedencia sobre o da OpenAI e montava o corpo no formato antigo
+ * (`max_tokens` + `temperature`, sem `reasoning_effort`), entao um segredo
+ * `AZURE_OPENAI_*` esquecido no projeto reproduzia silenciosamente falhas que
+ * ja tinham sido corrigidas do outro lado. Na FMP o Azure entra so como casa do
+ * Teams; a LLM e OpenAI direto.
  *
  * O QUE ESTA FUNCAO GARANTE, e o front nao teria como garantir:
- *   1. a chave nao vaza;
- *   2. quem chama e gestor ou admin ATIVO (reconferido no banco -- `verify_jwt`
- *      diz que o token e valido, nao quem e o dono);
+ *   1. a chave da LLM nao vaza;
+ *   2. quem chama e gestor ou admin ATIVO, reconferido no banco;
  *   3. todo numero citado no plano existe no snapshot (guarda de numeros);
- *   4. o modelo NAO tem ferramenta de envio: a garantia de "humano aprova" e
- *      arquitetural, nao de prompt;
+ *   4. o modelo NAO tem ferramenta de envio: "humano aprova" e arquitetural;
  *   5. a memoria carregada e so a validada e vigente, filtrada pelo escopo.
- *
- * Segredos esperados (supabase secrets set ...):
- *   AZURE_OPENAI_ENDPOINT    https://<recurso>.openai.azure.com
- *   AZURE_OPENAI_KEY
- *   AZURE_OPENAI_DEPLOYMENT  nome do deployment
- *   AZURE_OPENAI_API_VERSION opcional (padrao 2024-10-21)
- * ou, para OpenAI direto:
- *   OPENAI_API_KEY
- *   OPENAI_MODEL             opcional (padrao gpt-4.1)
  */
 import { createClient } from 'jsr:@supabase/supabase-js@2';
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
 const SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 
-const AZURE_ENDPOINT = Deno.env.get('AZURE_OPENAI_ENDPOINT') ?? '';
-const AZURE_KEY = Deno.env.get('AZURE_OPENAI_KEY') ?? '';
-const AZURE_DEPLOYMENT = Deno.env.get('AZURE_OPENAI_DEPLOYMENT') ?? '';
-const AZURE_API_VERSION = Deno.env.get('AZURE_OPENAI_API_VERSION') ?? '2024-10-21';
 const OPENAI_KEY = Deno.env.get('OPENAI_API_KEY') ?? '';
-// Conferido no catalogo da OpenAI em 06/08/2026: `gpt-5.6` e o modelo geral e
-// `gpt-5.6-terra` a opcao mais barata. Modelo e coisa que muda de nome sozinha
-// -- por isso `OPENAI_MODEL` deve ser cadastrado explicitamente no deploy, e
-// este padrao serve so para nao quebrar quem esquecer.
+/**
+ * Conferido no catalogo da OpenAI em 06/08/2026. `gpt-5.6` e um APELIDO que
+ * roteia para `gpt-5.6-sol`, o carro-chefe da familia. `gpt-5.6-terra` e o
+ * intermediario e `gpt-5.6-luna` o mais barato -- trocar aqui e questao de
+ * cadastrar o segredo, sem deploy.
+ */
 const OPENAI_MODEL = Deno.env.get('OPENAI_MODEL') ?? 'gpt-5.6';
 
-/** Teto por usuario/dia. Conta de LLM sem teto vira surpresa no fim do mes. */
+/**
+ * `reasoning_effort` fica travado em 'none' e NAO e configuravel.
+ *
+ * Nao e escolha de qualidade: a familia gpt-5 RECUSA function tools em
+ * /v1/chat/completions com qualquer outro valor -- a propria API responde
+ * "use /v1/responses or set reasoning_effort to 'none'". Como este modulo e
+ * inteiro construido sobre tool-calling, deixar isso em variavel de ambiente
+ * seria deixar um envelope aberto para derrubar producao por engano.
+ *
+ * Afrouxar isso exige migrar para /v1/responses, que muda o formato de
+ * requisicao E de resposta -- ou seja, muda este arquivo de qualquer forma.
+ */
+const REASONING = 'none';
+
+/**
+ * Modelo sem raciocinio recusa o parametro `reasoning_effort`. Decidir isso
+ * pelo PREFIXO do nome do modelo foi a causa de duas das tres falhas que este
+ * arquivo ja teve em producao -- entao aqui e escolha explicita de quem faz o
+ * deploy, nunca inferencia.
+ */
+const ENVIA_REASONING = (Deno.env.get('OPENAI_ENVIA_REASONING') ?? '1') === '1';
+
+/** Turnos por usuario nas ultimas 24h. Conta de LLM sem teto vira surpresa. */
 const LIMITE_TURNOS_DIA = 40;
-/** Historico enviado ao modelo. Acima disso, o excedente vira resumo. */
 const MAX_MENSAGENS_HISTORICO = 20;
-/** Voltas de tool-calling antes de desistir. */
-const MAX_VOLTAS = 6;
+
+/**
+ * Voltas de tool-calling. Quatro bastam com cinco ferramentas -- e cada volta
+ * e uma chamada de rede inteira contra o teto de tempo da Edge Function.
+ */
+const MAX_VOLTAS = 4;
+
+/**
+ * Orcamento de saida generoso de proposito: nos modelos da linha gpt-5 o
+ * raciocinio interno consome o MESMO orcamento da resposta. Com teto apertado,
+ * o modelo gasta tudo pensando e devolve conteudo vazio com finish_reason
+ * 'length' -- que aparece como "resposta vazia", nao como "faltou espaco".
+ */
+const TETO_SAIDA = 8000;
+
+/**
+ * Tempo. A Edge Function morre em 150s (plano Free) e o cliente fica no
+ * spinner ate la. Melhor devolver um erro legivel aos 110s do que deixar a
+ * plataforma matar a requisicao com um 546 sem corpo.
+ */
+const TIMEOUT_CHAMADA_MS = 45_000;
+const PRAZO_TOTAL_MS = 110_000;
+
+/** Teto do payload de snapshots. Cliente adulterado nao derruba a conta. */
+const MAX_SNAPSHOTS_BYTES = 200_000;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -61,8 +99,6 @@ function json(corpo: unknown, status = 200): Response {
     headers: { ...CORS, 'Content-Type': 'application/json' },
   });
 }
-
-// ------------------------------------------------------------------ tipos
 
 type Indicador = {
   chave: string;
@@ -108,8 +144,6 @@ type MensagemLLM = {
   tool_call_id?: string;
 };
 
-// ------------------------------------------------------------------ prompt
-
 const SISTEMA = `Você é o assistente de plano de ação da FMP (Fundação Escola Superior do Ministério Público).
 
 QUEM LÊ VOCÊ
@@ -140,12 +174,24 @@ REGRAS DURAS
 6. Use a memória institucional recebida. Quando usar, diga qual usou.
 7. Você não envia nada para ninguém. Quem comunica é a pessoa, com um clique.
 
+COMO TRABALHAR
+Chame ler_painel uma vez, listar_equipe uma vez, e então propor_plano. Não fique
+consultando em círculos: você tem poucas rodadas antes de a conversa ser cortada.
+Termine sempre com uma frase curta em texto, depois de propor o plano.
+
 ESTILO
 Frases curtas. Voz ativa. Sem "é importante notar", sem "vale destacar", sem
 listas de três por hábito. Se não sabe, diga que não sabe.`;
 
-// ------------------------------------------------------------------ ferramentas
-
+/**
+ * Schema NAO-strict de proposito.
+ *
+ * Ele usa `additionalProperties: false` e nulos por uniao, que sao as marcas de
+ * structured outputs -- mas ligar `strict: true` aqui QUEBRARIA com 400: em
+ * strict, toda propriedade precisa estar em `required` (e `alerta`,
+ * `responsavel_nome`, `esforco_horas` e `memoria_id` nao estao), e
+ * `minimum`/`maximum` nao sao suportados. Nao ligue sem reescrever o schema.
+ */
 const FERRAMENTAS = [
   {
     type: 'function',
@@ -190,8 +236,7 @@ const FERRAMENTAS = [
           titulo: { type: 'string' },
           resumo: {
             type: 'string',
-            description:
-              'UMA frase, em linguagem falada, dizendo o que chamou atenção. Abre a tela.',
+            description: 'UMA frase, em linguagem falada, dizendo o que chamou atenção. Abre a tela.',
           },
           alerta: {
             type: 'string',
@@ -253,8 +298,8 @@ const FERRAMENTAS = [
           area: { type: ['string', 'null'] },
           meses: {
             type: ['array', 'null'],
-            items: { type: 'integer', minimum: 1, maximum: 12 },
-            description: 'Só para sazonalidade recorrente.',
+            items: { type: 'integer' },
+            description: 'Só para sazonalidade recorrente: números de 1 a 12.',
           },
           vigente_ate: {
             type: ['string', 'null'],
@@ -268,20 +313,15 @@ const FERRAMENTAS = [
   },
 ] as const;
 
-// ------------------------------------------------------------------ guarda de números
+const JANELAS_VALIDAS = new Set(['esta_semana', 'proximas_semanas', 'quando_der']);
 
 type Falha = { indicador: string; recebido: number | null; esperado: number | null | 'inexistente' };
 
 /**
- * Rejeita plano que cite numero fora do snapshot.
+ * Guarda de numeros: rejeita plano que cite numero fora do snapshot.
  *
- * Sem esta guarda o modulo produz plano bonito com numero inventado -- o
- * antipadrao 1 do SPECS ("fallback silencioso de dado de negocio"). Com ela,
- * cada acao na tela ganha um selo de evidencia clicavel.
- *
- * Tolerancia relativa de 0,5%: o modelo escreve o numero de volta como texto e
- * pode perder digito de ponto flutuante. Diferenca maior que isso e outro
- * numero, nao arredondamento.
+ * Tolerancia relativa de 0,5% -- o modelo reescreve o valor como texto e pode
+ * perder digito. Diferenca maior que isso e outro numero, nao arredondamento.
  */
 function validaEvidencias(
   plano: { acoes?: Array<{ titulo?: string; evidencia?: { dashboard?: string; indicador?: string; valor?: number | null } }> },
@@ -312,58 +352,50 @@ function validaEvidencias(
   return falhas;
 }
 
-// ------------------------------------------------------------------ LLM
-
-/**
- * Orçamento de saída generoso de propósito.
- *
- * Nos modelos da linha gpt-5 o raciocínio interno consome o MESMO orçamento da
- * resposta. Com um teto apertado, o modelo gasta tudo pensando e devolve
- * conteúdo vazio com `finish_reason: 'length'` — que aparece como "resposta
- * vazia", não como "faltou espaço".
- */
-const TETO_SAIDA = 8000;
-
 async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknown>> {
-  const base: Record<string, unknown> = {
+  if (!OPENAI_KEY) {
+    throw new Error(
+      'LLM não configurada nesta função. Cadastre OPENAI_API_KEY nos Secrets das Edge Functions.',
+    );
+  }
+
+  const corpo: Record<string, unknown> = {
+    model: OPENAI_MODEL,
     messages: mensagens,
     tools: FERRAMENTAS,
     tool_choice: 'auto',
+    // `max_tokens` e `temperature` NAO entram: os modelos atuais recusam os dois.
+    max_completion_tokens: TETO_SAIDA,
   };
-  let corpo: Record<string, unknown>;
+  if (ENVIA_REASONING) corpo.reasoning_effort = REASONING;
 
-  let url: string;
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-
-  if (AZURE_ENDPOINT && AZURE_KEY && AZURE_DEPLOYMENT) {
-    url = `${AZURE_ENDPOINT.replace(/\/$/, '')}/openai/deployments/${AZURE_DEPLOYMENT}/chat/completions?api-version=${AZURE_API_VERSION}`;
-    headers['api-key'] = AZURE_KEY;
-    // A API do Azure na versão fixada aqui ainda usa os nomes antigos.
-    corpo = { ...base, max_tokens: TETO_SAIDA, temperature: 0.2 };
-  } else if (OPENAI_KEY) {
-    url = 'https://api.openai.com/v1/chat/completions';
-    headers.Authorization = `Bearer ${OPENAI_KEY}`;
-    // Os modelos atuais da OpenAI trocaram `max_tokens` por
-    // `max_completion_tokens` e recusam `temperature` fora do padrão —
-    // mandar qualquer um dos dois derruba a chamada com 400.
-    corpo = { ...base, model: OPENAI_MODEL, max_completion_tokens: TETO_SAIDA };
-  } else {
-    throw new Error('LLM não configurada nesta função.');
+  let resposta: Response;
+  try {
+    resposta = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
+      body: JSON.stringify(corpo),
+      signal: AbortSignal.timeout(TIMEOUT_CHAMADA_MS),
+    });
+  } catch (err) {
+    // Sem isto, um travamento da OpenAI vira 546 sem corpo -- erro de CORS na
+    // tela do usuario, e nenhuma pista de onde olhar.
+    const nome = err instanceof Error ? err.name : '';
+    if (nome === 'TimeoutError' || nome === 'AbortError') {
+      throw new Error('A LLM demorou demais para responder. Tente de novo.');
+    }
+    throw new Error('Não foi possível falar com a LLM. Verifique a conexão de saída.');
   }
 
-  const resposta = await fetch(url, { method: 'POST', headers, body: JSON.stringify(corpo) });
   if (!resposta.ok) {
     // Le SO o objeto `error` da resposta -- nunca o corpo que enviamos, que
-    // carrega trecho do snapshot. `error.message` da OpenAI e diagnostico puro
-    // ("The model `x` does not exist") e vale muito mais que "nao respondeu":
-    // sem ele, o operador ve uma tela vermelha e nao sabe se e chave, modelo,
-    // cota ou rede. Cortado em 300 caracteres.
+    // carrega trecho do snapshot. Cortado em 300 caracteres.
     let detalhe = '';
     try {
       const erroApi = (await resposta.json()) as { error?: { message?: string; code?: string } };
       detalhe = String(erroApi?.error?.message ?? erroApi?.error?.code ?? '').slice(0, 300);
     } catch {
-      // resposta sem JSON: segue só com o status
+      // resposta sem JSON: segue so com o status
     }
     console.error(`[plano-agente] LLM respondeu ${resposta.status}: ${detalhe}`);
 
@@ -371,9 +403,7 @@ async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknow
       throw new Error(`A chave da LLM foi recusada (${resposta.status}). Confira o segredo OPENAI_API_KEY. ${detalhe}`);
     }
     if (resposta.status === 400 || resposta.status === 404) {
-      throw new Error(
-        `A LLM recusou a chamada (${resposta.status}). Quase sempre é o nome do modelo — confira OPENAI_MODEL (ou AZURE_OPENAI_DEPLOYMENT). ${detalhe}`,
-      );
+      throw new Error(`A LLM recusou a chamada (${resposta.status}). ${detalhe}`);
     }
     if (resposta.status === 429) {
       throw new Error('A LLM está sem cota ou no limite de uso. Confira o saldo da conta.');
@@ -383,251 +413,293 @@ async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknow
   return (await resposta.json()) as Record<string, unknown>;
 }
 
-// ------------------------------------------------------------------ handler
-
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS });
   if (req.method !== 'POST') return json({ erro: 'Método não suportado.' }, 405);
 
-  const token = (req.headers.get('Authorization') ?? '').replace(/^Bearer\s+/i, '');
-  if (!token) return json({ erro: 'Sessão ausente.' }, 401);
-
-  let corpo: Record<string, unknown>;
+  // try/catch externo: sem ele, qualquer excecao inesperada sobe como 500 SEM
+  // os cabecalhos de CORS, e o navegador reporta erro de CORS em vez da
+  // mensagem -- diagnostico ruim justamente na hora ruim.
   try {
-    corpo = await req.json();
-  } catch {
-    return json({ erro: 'Corpo da requisição inválido.' }, 400);
-  }
+    const token = (req.headers.get('Authorization') ?? '').replace(/^Bearer\s+/i, '');
+    if (!token) return json({ erro: 'Sessão ausente.' }, 401);
 
-  const admin = createClient(SUPABASE_URL, SERVICE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-
-  const { data: usuario, error: erroUsuario } = await admin.auth.getUser(token);
-  if (erroUsuario || !usuario?.user) return json({ erro: 'Sessão inválida ou expirada.' }, 401);
-  const idChamador = usuario.user.id;
-
-  // `verify_jwt` garante token valido, nao papel: reconfere sempre no banco.
-  const { data: perfil } = await admin
-    .from('perfis')
-    .select('papel, ativo, nome_completo')
-    .eq('id', idChamador)
-    .maybeSingle();
-  if (!perfil?.ativo) return json({ erro: 'Acesso não autorizado.' }, 403);
-
-  const mensagem = String(corpo.mensagem ?? '').trim();
-  if (!mensagem) return json({ erro: 'Escreva alguma coisa para o assistente.' }, 400);
-  if (mensagem.length > 4000) return json({ erro: 'Mensagem longa demais.' }, 400);
-
-  const contexto = (corpo.contexto ?? {}) as { slug_ativo?: string; snapshots?: Record<string, Snapshot> };
-  const snapshots = contexto.snapshots ?? {};
-  const slugAtivo = String(contexto.slug_ativo ?? Object.keys(snapshots)[0] ?? '');
-  const snapAtivo = snapshots[slugAtivo];
-  if (!snapAtivo) return json({ erro: 'Nenhum painel foi enviado para leitura.' }, 400);
-
-  // ---- limite diário -------------------------------------------------
-  const inicioDoDia = new Date();
-  inicioDoDia.setHours(0, 0, 0, 0);
-  const { count: turnosHoje } = await admin
-    .schema('plano')
-    .from('mensagens')
-    .select('id', { count: 'exact', head: true })
-    .eq('papel', 'user')
-    .gte('criado_em', inicioDoDia.toISOString());
-  if ((turnosHoje ?? 0) > LIMITE_TURNOS_DIA * 20) {
-    return json({ erro: 'Limite de uso do assistente atingido por hoje.' }, 429);
-  }
-
-  // ---- memória no escopo ---------------------------------------------
-  // Filtro determinístico pelas dimensões do próprio snapshot: dá para mostrar
-  // ao usuário exatamente o que entrou. Ver arquitetura §5.3.1.
-  const { data: memorias } = await admin.rpc('plano_memoria_no_escopo', {
-    p_dashboard: slugAtivo,
-    p_produto: snapAtivo.recorte.produto ?? null,
-    p_indicadores: snapAtivo.indicadores.map((i) => i.chave),
-    p_areas: null,
-    p_mes: snapAtivo.recorte.mesReferencia ?? null,
-  });
-  const memoriaLista = (memorias ?? []) as Memoria[];
-
-  // ---- histórico ------------------------------------------------------
-  let conversaId = typeof corpo.conversa_id === 'string' ? corpo.conversa_id : null;
-  const historico: MensagemLLM[] = [];
-
-  if (conversaId) {
-    const { data: dono } = await admin
-      .schema('plano')
-      .from('conversas')
-      .select('id')
-      .eq('id', conversaId)
-      .eq('autor_id', idChamador)
-      .maybeSingle();
-    if (!dono) return json({ erro: 'Conversa não encontrada.' }, 404);
-
-    const { data: msgs } = await admin
-      .schema('plano')
-      .from('mensagens')
-      .select('papel, conteudo')
-      .eq('conversa_id', conversaId)
-      .order('id', { ascending: false })
-      .limit(MAX_MENSAGENS_HISTORICO);
-    for (const m of (msgs ?? []).reverse()) {
-      const c = m.conteudo as { texto?: string };
-      if (c?.texto) historico.push({ role: m.papel === 'user' ? 'user' : 'assistant', content: c.texto });
-    }
-  } else {
-    const { data: nova } = await admin
-      .schema('plano')
-      .from('conversas')
-      .insert({ autor_id: idChamador, dashboard_slug: slugAtivo, titulo: mensagem.slice(0, 80) })
-      .select('id')
-      .single();
-    conversaId = nova?.id ?? null;
-  }
-
-  // ---- montagem do contexto ------------------------------------------
-  const blocoMemoria = memoriaLista.length
-    ? `O que a equipe já te ensinou e vale para este recorte:\n${memoriaLista
-        .map((m) => `- [${m.id}] (${m.tipo}) ${m.conteudo}`)
-        .join('\n')}`
-    : 'A equipe ainda não te ensinou nada que se aplique a este recorte.';
-
-  const mensagens: MensagemLLM[] = [
-    { role: 'system', content: SISTEMA },
-    {
-      role: 'system',
-      content:
-        `Hoje é ${new Date().toLocaleDateString('pt-BR')}. Quem fala com você é ${perfil.nome_completo}.\n\n` +
-        `Painel aberto agora: ${snapAtivo.titulo} (${slugAtivo}), recorte "${snapAtivo.recorte.descricao}".\n` +
-        `Use ler_painel para ver os números. Painéis disponíveis: ${Object.keys(snapshots).join(', ')}.\n\n` +
-        blocoMemoria,
-    },
-    ...historico,
-    { role: 'user', content: mensagem },
-  ];
-
-  // ---- laço de tool-calling -------------------------------------------
-  let planoProposto: unknown = null;
-  let memoriaProposta: unknown = null;
-  let textoFinal = '';
-  const memoriasUsadas = new Set<string>();
-
-  for (let volta = 0; volta < MAX_VOLTAS; volta++) {
-    let resposta: Record<string, unknown>;
+    let corpo: Record<string, unknown>;
     try {
-      resposta = await chamaLLM(mensagens);
-    } catch (err) {
-      return json({ erro: err instanceof Error ? err.message : 'Falha no assistente.' }, 502);
+      corpo = await req.json();
+    } catch {
+      return json({ erro: 'Corpo da requisição inválido.' }, 400);
     }
 
-    const escolha = (resposta.choices as Array<Record<string, unknown>> | undefined)?.[0];
-    const msg = escolha?.message as MensagemLLM | undefined;
-    if (!msg) return json({ erro: 'Resposta vazia do assistente.' }, 502);
+    const admin = createClient(SUPABASE_URL, SERVICE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
 
-    mensagens.push(msg);
-    const chamadas = msg.tool_calls ?? [];
+    const { data: usuario, error: erroUsuario } = await admin.auth.getUser(token);
+    if (erroUsuario || !usuario?.user) return json({ erro: 'Sessão inválida ou expirada.' }, 401);
+    const idChamador = usuario.user.id;
 
-    if (chamadas.length === 0) {
-      textoFinal = msg.content ?? '';
-      // Estouro de orçamento devolve conteúdo vazio. Sem este aviso, a tela
-      // volta sozinha para a escolha de painel como se nada tivesse acontecido
-      // — o usuário clica de novo e cai no mesmo buraco.
-      if (!textoFinal && escolha?.finish_reason === 'length') {
+    // `verify_jwt` garante token valido, nao papel: reconfere sempre no banco.
+    const { data: perfil } = await admin
+      .from('perfis')
+      .select('papel, ativo, nome_completo')
+      .eq('id', idChamador)
+      .maybeSingle();
+    const papel = String(perfil?.papel ?? '');
+    if (!perfil?.ativo || (papel !== 'gestor' && papel !== 'admin')) {
+      return json({ erro: 'Acesso não autorizado.' }, 403);
+    }
+
+    const mensagem = String(corpo.mensagem ?? '').trim();
+    if (!mensagem) return json({ erro: 'Escreva alguma coisa para o assistente.' }, 400);
+    if (mensagem.length > 4000) return json({ erro: 'Mensagem longa demais.' }, 400);
+
+    const contexto = (corpo.contexto ?? {}) as { slug_ativo?: string; snapshots?: Record<string, Snapshot> };
+    const snapshots = contexto.snapshots ?? {};
+    if (JSON.stringify(snapshots).length > MAX_SNAPSHOTS_BYTES) {
+      return json({ erro: 'O recorte enviado é grande demais. Aplique um filtro mais estreito.' }, 400);
+    }
+    const slugAtivo = String(contexto.slug_ativo ?? Object.keys(snapshots)[0] ?? '');
+    const snapAtivo = snapshots[slugAtivo];
+    if (!snapAtivo) return json({ erro: 'Nenhum painel foi enviado para leitura.' }, 400);
+
+    // ---- teto de uso, POR USUARIO -------------------------------------
+    // Janela de 24h corridas em vez de "dia civil": o runtime roda em UTC, e um
+    // teto que zera 21h no horario de Brasilia confunde mais do que protege.
+    const desde = new Date(Date.now() - 86_400_000).toISOString();
+    const { data: minhasConversas } = await admin
+      .schema('plano')
+      .from('conversas')
+      .select('id')
+      .eq('autor_id', idChamador)
+      .gte('criado_em', desde);
+    const idsConversas = (minhasConversas ?? []).map((c) => (c as { id: string }).id);
+    if (idsConversas.length > 0) {
+      const { count } = await admin
+        .schema('plano')
+        .from('mensagens')
+        .select('id', { count: 'exact', head: true })
+        .eq('papel', 'user')
+        .in('conversa_id', idsConversas);
+      if ((count ?? 0) >= LIMITE_TURNOS_DIA) {
+        return json({ erro: 'Você atingiu o limite de uso do assistente por hoje.' }, 429);
+      }
+    }
+
+    // ---- memoria no escopo --------------------------------------------
+    const { data: memorias } = await admin.rpc('plano_memoria_no_escopo', {
+      p_dashboard: slugAtivo,
+      p_produto: snapAtivo.recorte.produto ?? null,
+      p_indicadores: snapAtivo.indicadores.map((i) => i.chave),
+      p_areas: null,
+      p_mes: snapAtivo.recorte.mesReferencia ?? null,
+    });
+    const memoriaLista = (memorias ?? []) as Memoria[];
+
+    // ---- historico -----------------------------------------------------
+    let conversaId = typeof corpo.conversa_id === 'string' ? corpo.conversa_id : null;
+    const historico: MensagemLLM[] = [];
+
+    if (conversaId) {
+      const { data: dono } = await admin
+        .schema('plano')
+        .from('conversas')
+        .select('id')
+        .eq('id', conversaId)
+        .eq('autor_id', idChamador)
+        .maybeSingle();
+      if (!dono) return json({ erro: 'Conversa não encontrada.' }, 404);
+
+      const { data: msgs } = await admin
+        .schema('plano')
+        .from('mensagens')
+        .select('papel, conteudo')
+        .eq('conversa_id', conversaId)
+        .order('id', { ascending: false })
+        .limit(MAX_MENSAGENS_HISTORICO);
+      for (const m of (msgs ?? []).reverse()) {
+        const c = m.conteudo as { texto?: string };
+        if (c?.texto) historico.push({ role: m.papel === 'user' ? 'user' : 'assistant', content: c.texto });
+      }
+    } else {
+      const { data: nova } = await admin
+        .schema('plano')
+        .from('conversas')
+        .insert({ autor_id: idChamador, dashboard_slug: slugAtivo, titulo: mensagem.slice(0, 80) })
+        .select('id')
+        .single();
+      conversaId = nova?.id ?? null;
+    }
+
+    const blocoMemoria = memoriaLista.length
+      ? `O que a equipe já te ensinou e vale para este recorte:\n${memoriaLista
+          .map((m) => `- [${m.id}] (${m.tipo}) ${m.conteudo}`)
+          .join('\n')}`
+      : 'A equipe ainda não te ensinou nada que se aplique a este recorte.';
+
+    const mensagens: MensagemLLM[] = [
+      { role: 'system', content: SISTEMA },
+      {
+        role: 'system',
+        content:
+          `Hoje é ${new Date().toLocaleDateString('pt-BR')}. Quem fala com você é ${perfil.nome_completo}.\n\n` +
+          `Painel aberto agora: ${snapAtivo.titulo} (${slugAtivo}), recorte "${snapAtivo.recorte.descricao}".\n` +
+          `Use ler_painel para ver os números. Painéis disponíveis: ${Object.keys(snapshots).join(', ')}.\n\n` +
+          blocoMemoria,
+      },
+      ...historico,
+      { role: 'user', content: mensagem },
+    ];
+
+    // ---- laco de tool-calling -------------------------------------------
+    let planoProposto: unknown = null;
+    let memoriaProposta: unknown = null;
+    let textoFinal = '';
+    const memoriasUsadas = new Set<string>();
+    const prazo = Date.now() + PRAZO_TOTAL_MS;
+
+    for (let volta = 0; volta < MAX_VOLTAS; volta++) {
+      if (Date.now() > prazo) break;
+
+      let resposta: Record<string, unknown>;
+      try {
+        resposta = await chamaLLM(mensagens);
+      } catch (err) {
+        return json({ erro: err instanceof Error ? err.message : 'Falha no assistente.' }, 502);
+      }
+
+      const escolha = (resposta.choices as Array<Record<string, unknown>> | undefined)?.[0];
+      const msg = escolha?.message as MensagemLLM | undefined;
+      if (!msg) return json({ erro: 'Resposta vazia do assistente.' }, 502);
+
+      // Truncamento e checado ANTES de olhar as tool calls. Quando o corte cai
+      // dentro de `function.arguments`, o JSON quebra, os argumentos viram {} e
+      // um plano VAZIO seria aceito como valido -- o "fallback silencioso" que
+      // a guarda de numeros existe justamente para impedir.
+      if (escolha?.finish_reason === 'length') {
         return json(
-          { erro: 'O assistente ficou sem espaço para responder. Tente uma pergunta mais curta.' },
+          { erro: 'O assistente ficou sem espaço para responder. Peça um plano mais curto.' },
           502,
         );
       }
-      break;
-    }
 
-    for (const chamada of chamadas) {
-      const nome = chamada.function.name;
-      let args: Record<string, unknown> = {};
-      try {
-        args = JSON.parse(chamada.function.arguments || '{}');
-      } catch {
-        /* argumento malformado cai no default abaixo */
+      mensagens.push(msg);
+      const chamadas = msg.tool_calls ?? [];
+
+      if (chamadas.length === 0) {
+        textoFinal = msg.content ?? '';
+        break;
       }
-      let resultado: unknown;
 
-      if (nome === 'listar_paineis') {
-        resultado = Object.values(snapshots).map((s) => ({
-          slug: s.slug,
-          titulo: s.titulo,
-          recorte: s.recorte.descricao,
-        }));
-      } else if (nome === 'ler_painel') {
-        // Resolve do payload que o cliente mandou. A funcao NUNCA consulta
-        // tabela de negocio: a regra de calculo vive no navegador, e recalcular
-        // aqui produziria numero diferente do que esta na tela.
-        const s = snapshots[String(args.slug ?? '')];
-        resultado = s ?? { erro: 'Painel não disponível nesta conversa.' };
-      } else if (nome === 'listar_equipe') {
-        const { data } = await admin.rpc('equipe');
-        resultado = data ?? [];
-      } else if (nome === 'propor_plano') {
-        const falhas = validaEvidencias(args as never, snapshots);
-        if (falhas.length > 0) {
-          // Devolve ao modelo para corrigir, em vez de aceitar numero inventado.
-          resultado = {
-            aceito: false,
-            erro: 'Números divergentes do painel. Corrija usando exatamente o valor do indicador.',
-            divergencias: falhas,
-          };
-        } else {
-          planoProposto = args;
-          for (const a of (args.acoes as Array<{ memoria_id?: string | null }> | undefined) ?? []) {
-            if (a.memoria_id) memoriasUsadas.add(a.memoria_id);
-          }
-          resultado = { aceito: true, acoes: (args.acoes as unknown[] | undefined)?.length ?? 0 };
+      for (const chamada of chamadas) {
+        const nome = chamada.function.name;
+        let args: Record<string, unknown>;
+        try {
+          args = JSON.parse(chamada.function.arguments || '{}');
+        } catch {
+          // Devolve o erro AO MODELO para ele reenviar, em vez de seguir com
+          // argumentos vazios fingindo que deu certo.
+          mensagens.push({
+            role: 'tool',
+            tool_call_id: chamada.id,
+            content: JSON.stringify({ erro: 'Argumentos JSON malformados. Reenvie a chamada completa e mais curta.' }),
+          });
+          continue;
         }
-      } else if (nome === 'propor_memoria') {
-        // Devolve para a tela. NUNCA grava: quem valida e sempre pessoa.
-        memoriaProposta = args;
-        resultado = { aceito: true, aviso: 'Aguardando a pessoa confirmar. Nada foi gravado.' };
-      } else {
-        resultado = { erro: 'Ferramenta desconhecida.' };
+        let resultado: unknown;
+
+        if (nome === 'listar_paineis') {
+          resultado = Object.values(snapshots).map((s) => ({
+            slug: s.slug,
+            titulo: s.titulo,
+            recorte: s.recorte.descricao,
+          }));
+        } else if (nome === 'ler_painel') {
+          // Resolve do payload que o cliente mandou. A funcao NUNCA consulta
+          // tabela de negocio: a regra de calculo vive no navegador, e
+          // recalcular aqui daria numero diferente do que esta na tela.
+          const s = snapshots[String(args.slug ?? '')];
+          resultado = s ?? { erro: 'Painel não disponível nesta conversa.' };
+        } else if (nome === 'listar_equipe') {
+          const { data } = await admin.rpc('equipe');
+          resultado = data ?? [];
+        } else if (nome === 'propor_plano') {
+          const falhas = validaEvidencias(args as never, snapshots);
+          // `janela` fora do enum quebraria o agrupamento da tela. O schema
+          // nao-strict nao garante isso do lado da OpenAI -- garantimos aqui.
+          for (const a of (args.acoes as Array<{ janela?: string }> | undefined) ?? []) {
+            if (!JANELAS_VALIDAS.has(String(a.janela))) a.janela = 'proximas_semanas';
+          }
+          if (falhas.length > 0) {
+            resultado = {
+              aceito: false,
+              erro: 'Números divergentes do painel. Corrija usando exatamente o valor do indicador.',
+              divergencias: falhas,
+            };
+          } else {
+            planoProposto = args;
+            for (const a of (args.acoes as Array<{ memoria_id?: string | null }> | undefined) ?? []) {
+              if (a.memoria_id) memoriasUsadas.add(a.memoria_id);
+            }
+            resultado = { aceito: true, acoes: (args.acoes as unknown[] | undefined)?.length ?? 0 };
+          }
+        } else if (nome === 'propor_memoria') {
+          // Devolve para a tela. NUNCA grava: quem valida e sempre pessoa.
+          memoriaProposta = args;
+          resultado = { aceito: true, aviso: 'Aguardando a pessoa confirmar. Nada foi gravado.' };
+        } else {
+          resultado = { erro: 'Ferramenta desconhecida.' };
+        }
+
+        mensagens.push({
+          role: 'tool',
+          tool_call_id: chamada.id,
+          content: JSON.stringify(resultado),
+        });
       }
-
-      mensagens.push({
-        role: 'tool',
-        tool_call_id: chamada.id,
-        content: JSON.stringify(resultado),
-      });
     }
-  }
 
-  // ---- persistência do turno -------------------------------------------
-  if (conversaId) {
-    await admin
-      .schema('plano')
-      .from('mensagens')
-      .insert([
-        { conversa_id: conversaId, papel: 'user', conteudo: { texto: mensagem } },
-        { conversa_id: conversaId, papel: 'assistant', conteudo: { texto: textoFinal } },
-      ]);
-  }
-
-  // Contabiliza uso da memoria: memoria nunca usada em 6 meses e candidata a
-  // remocao; memoria muito usada e candidata a virar regra de codigo.
-  for (const id of memoriasUsadas) {
-    try {
-      await admin.rpc('plano_memoria_incrementa_uso', { p_id: id });
-    } catch {
-      // Contador é telemetria, não regra: falhar aqui não pode derrubar o turno.
+    // Sair do laco sem NADA e indistinguivel de "nao respondeu" na tela -- o
+    // sintoma mais caro de diagnosticar. Melhor dizer o que aconteceu.
+    if (!textoFinal && !planoProposto && !memoriaProposta) {
+      return json(
+        { erro: 'O assistente se perdeu consultando os painéis e não chegou a um plano. Reformule o pedido.' },
+        502,
+      );
     }
-  }
 
-  return json({
-    conversa_id: conversaId,
-    resposta: textoFinal,
-    plano: planoProposto,
-    memoria_proposta: memoriaProposta,
-    memorias_consideradas: memoriaLista.map((m) => ({
-      id: m.id,
-      conteudo: m.conteudo,
-      tipo: m.tipo,
-    })),
-  });
+    // ---- persistencia do turno -------------------------------------------
+    if (conversaId) {
+      await admin
+        .schema('plano')
+        .from('mensagens')
+        .insert([
+          { conversa_id: conversaId, papel: 'user', conteudo: { texto: mensagem } },
+          { conversa_id: conversaId, papel: 'assistant', conteudo: { texto: textoFinal } },
+        ]);
+    }
+
+    for (const id of memoriasUsadas) {
+      try {
+        await admin.rpc('plano_memoria_incrementa_uso', { p_id: id });
+      } catch {
+        // Contador e telemetria, nao regra: falhar aqui nao derruba o turno.
+      }
+    }
+
+    return json({
+      conversa_id: conversaId,
+      resposta: textoFinal,
+      plano: planoProposto,
+      memoria_proposta: memoriaProposta,
+      memorias_consideradas: memoriaLista.map((m) => ({
+        id: m.id,
+        conteudo: m.conteudo,
+        tipo: m.tipo,
+      })),
+    });
+  } catch (err) {
+    console.error('[plano-agente] falha inesperada:', err instanceof Error ? err.message : err);
+    return json({ erro: 'Falha inesperada no assistente. Tente de novo em instantes.' }, 500);
+  }
 });

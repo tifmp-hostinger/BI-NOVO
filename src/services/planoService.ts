@@ -12,6 +12,12 @@ import type { DashboardSnapshot } from '@/lib/snapshotTypes';
 const URL_FUNCOES = `${leConfig('VITE_SUPABASE_URL', import.meta.env.VITE_SUPABASE_URL).valor}/functions/v1`;
 const ANON = leConfig('VITE_SUPABASE_ANON_KEY', import.meta.env.VITE_SUPABASE_ANON_KEY).valor;
 
+/**
+ * Um pouco acima do teto da Edge Function (150s no plano Free): assim o erro
+ * que o usuário vê é o nosso, com texto, e não um corte da plataforma.
+ */
+const TIMEOUT_MS = 160_000;
+
 export class ErroPlano extends Error {
   readonly status: number;
   constructor(mensagem: string, status: number) {
@@ -96,8 +102,16 @@ async function chamaFuncao<T>(nome: string, corpo: unknown): Promise<T> {
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(corpo),
+      // Sem teto, a plataforma mata a requisição por conta própria e devolve
+      // uma resposta SEM corpo — o usuário fica no spinner até lá e depois
+      // recebe uma mensagem genérica. Melhor cortar antes e dizer o que houve.
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
-  } catch {
+  } catch (err) {
+    const tipo = err instanceof Error ? err.name : '';
+    if (tipo === 'TimeoutError' || tipo === 'AbortError') {
+      throw new ErroPlano('O assistente demorou demais para responder. Tente de novo.', 408);
+    }
     throw new ErroPlano('Não foi possível falar com o servidor. Verifique a conexão.', 0);
   }
 
