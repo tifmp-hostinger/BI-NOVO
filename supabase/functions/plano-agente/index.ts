@@ -8,19 +8,16 @@
  *   OPENAI_MODEL             opcional; padrao 'gpt-5.6'
  *   OPENAI_ENVIA_REASONING   opcional; '1' (padrao) ou '0' para modelo sem raciocinio
  *
- * NAO existe mais caminho para Azure OpenAI. Ele foi removido de proposito: o
- * ramo tinha precedencia sobre o da OpenAI e montava o corpo no formato antigo
- * (`max_tokens` + `temperature`, sem `reasoning_effort`), entao um segredo
- * `AZURE_OPENAI_*` esquecido no projeto reproduzia silenciosamente falhas que
- * ja tinham sido corrigidas do outro lado. Na FMP o Azure entra so como casa do
- * Teams; a LLM e OpenAI direto.
+ * PRINCIPIO DE DESENHO. Ferramenta e para o que NAO da para prever. Tudo que
+ * ja esta em maos -- o snapshot do painel aberto e a equipe -- vai DIRETO no
+ * prompt. A versao anterior obrigava o modelo a "buscar" esses dois com
+ * chamadas de ferramenta, gastava as rodadas nisso e terminava sem plano:
+ * cada busca desnecessaria e uma viagem de rede E uma chance a mais de o
+ * modelo se perder. Sobra ao modelo uma tarefa so: propor o plano.
  *
- * O QUE ESTA FUNCAO GARANTE, e o front nao teria como garantir:
- *   1. a chave da LLM nao vaza;
- *   2. quem chama e gestor ou admin ATIVO, reconferido no banco;
- *   3. todo numero citado no plano existe no snapshot (guarda de numeros);
- *   4. o modelo NAO tem ferramenta de envio: "humano aprova" e arquitetural;
- *   5. a memoria carregada e so a validada e vigente, filtrada pelo escopo.
+ * NAO existe caminho para Azure OpenAI. Removido de proposito: o ramo tinha
+ * precedencia sobre o da OpenAI e montava o corpo no formato antigo, entao um
+ * segredo AZURE_OPENAI_* esquecido reproduzia falhas ja corrigidas.
  */
 import { createClient } from 'jsr:@supabase/supabase-js@2';
 
@@ -30,61 +27,32 @@ const SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 const OPENAI_KEY = Deno.env.get('OPENAI_API_KEY') ?? '';
 /**
  * Conferido no catalogo da OpenAI em 06/08/2026. `gpt-5.6` e um APELIDO que
- * roteia para `gpt-5.6-sol`, o carro-chefe da familia. `gpt-5.6-terra` e o
- * intermediario e `gpt-5.6-luna` o mais barato -- trocar aqui e questao de
- * cadastrar o segredo, sem deploy.
+ * roteia para `gpt-5.6-sol`, o carro-chefe. `gpt-5.6-terra` e o intermediario
+ * e `gpt-5.6-luna` o mais barato -- trocar e questao de cadastrar o segredo.
  */
 const OPENAI_MODEL = Deno.env.get('OPENAI_MODEL') ?? 'gpt-5.6';
 
 /**
- * `reasoning_effort` fica travado em 'none' e NAO e configuravel.
- *
- * Nao e escolha de qualidade: a familia gpt-5 RECUSA function tools em
- * /v1/chat/completions com qualquer outro valor -- a propria API responde
- * "use /v1/responses or set reasoning_effort to 'none'". Como este modulo e
- * inteiro construido sobre tool-calling, deixar isso em variavel de ambiente
- * seria deixar um envelope aberto para derrubar producao por engano.
- *
- * Afrouxar isso exige migrar para /v1/responses, que muda o formato de
- * requisicao E de resposta -- ou seja, muda este arquivo de qualquer forma.
+ * `reasoning_effort` travado em 'none' e NAO configuravel: a familia gpt-5
+ * RECUSA function tools em /v1/chat/completions com qualquer outro valor.
  */
 const REASONING = 'none';
-
-/**
- * Modelo sem raciocinio recusa o parametro `reasoning_effort`. Decidir isso
- * pelo PREFIXO do nome do modelo foi a causa de duas das tres falhas que este
- * arquivo ja teve em producao -- entao aqui e escolha explicita de quem faz o
- * deploy, nunca inferencia.
- */
+/** Modelo sem raciocinio recusa o parametro. Escolha explicita, nunca inferida. */
 const ENVIA_REASONING = (Deno.env.get('OPENAI_ENVIA_REASONING') ?? '1') === '1';
 
-/** Turnos por usuario nas ultimas 24h. Conta de LLM sem teto vira surpresa. */
 const LIMITE_TURNOS_DIA = 40;
 const MAX_MENSAGENS_HISTORICO = 20;
 
 /**
- * Voltas de tool-calling. Quatro bastam com cinco ferramentas -- e cada volta
- * e uma chamada de rede inteira contra o teto de tempo da Edge Function.
+ * Com snapshot e equipe ja no prompt, o caminho feliz sao DUAS voltas:
+ * propor_plano e a frase final. O resto e folga para correcao da guarda de
+ * numeros -- e o prazo abaixo e quem manda de verdade.
  */
-const MAX_VOLTAS = 4;
+const MAX_VOLTAS = 6;
 
-/**
- * Orcamento de saida generoso de proposito: nos modelos da linha gpt-5 o
- * raciocinio interno consome o MESMO orcamento da resposta. Com teto apertado,
- * o modelo gasta tudo pensando e devolve conteudo vazio com finish_reason
- * 'length' -- que aparece como "resposta vazia", nao como "faltou espaco".
- */
 const TETO_SAIDA = 8000;
-
-/**
- * Tempo. A Edge Function morre em 150s (plano Free) e o cliente fica no
- * spinner ate la. Melhor devolver um erro legivel aos 110s do que deixar a
- * plataforma matar a requisicao com um 546 sem corpo.
- */
 const TIMEOUT_CHAMADA_MS = 45_000;
 const PRAZO_TOTAL_MS = 110_000;
-
-/** Teto do payload de snapshots. Cliente adulterado nao derruba a conta. */
 const MAX_SNAPSHOTS_BYTES = 200_000;
 
 const CORS = {
@@ -137,6 +105,8 @@ type Memoria = {
   vigente_ate: string | null;
 };
 
+type Colega = { nome_completo: string; cargo: string | null; area: string | null };
+
 type MensagemLLM = {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | null;
@@ -160,158 +130,140 @@ LÉXICO OBRIGATÓRIO — nunca use a coluna da esquerda:
 Nome de tabela, slug de painel e sigla técnica NUNCA aparecem na resposta.
 
 REGRAS DURAS
-1. Todo número que você citar precisa vir de um indicador do snapshot. Você NÃO
-   calcula, NÃO estima e NÃO arredonda para um valor "bonito". Um número que não
-   está no snapshot é uma invenção, e o turno será rejeitado.
-2. Cada ação carrega uma evidência: { dashboard, indicador, valor } — copiada
-   exatamente do snapshot.
+1. Todo número que você citar precisa vir de um indicador que você recebeu. Você
+   NÃO calcula, NÃO estima e NÃO arredonda para um valor "bonito". Um número que
+   não está na lista é uma invenção, e o turno será rejeitado.
+2. Cada ação carrega uma evidência: dashboard, indicador e valor. O campo
+   indicador é a CHAVE do indicador (coluna da esquerda), e valor é o número
+   exato dele, sem arredondar.
 3. Indicador marcado como amostra pequena NÃO sustenta recomendação de mudança.
    Sinalize a incerteza e proponha medir melhor.
-4. Leia as observações do snapshot antes de apontar anomalia: boa parte do que
-   parece estranho é regra herdada do Power BI, e apontá-la como problema queima
-   sua credibilidade.
+4. Leia as observações antes de apontar anomalia: boa parte do que parece
+   estranho é regra herdada do Power BI, e apontá-la como problema queima sua
+   credibilidade.
 5. Se o frescor indicar carga parada, diga isso ANTES de recomendar qualquer coisa.
 6. Use a memória institucional recebida. Quando usar, diga qual usou.
 7. Você não envia nada para ninguém. Quem comunica é a pessoa, com um clique.
 
 COMO TRABALHAR
-Chame ler_painel uma vez, listar_equipe uma vez, e então propor_plano. Não fique
-consultando em círculos: você tem poucas rodadas antes de a conversa ser cortada.
-Termine sempre com uma frase curta em texto, depois de propor o plano.
+Os números do painel e a equipe já estão nesta conversa — não peça de novo.
+Chame propor_plano UMA vez, com 3 a 6 ações, e depois escreva uma frase curta.
+Se propor_plano voltar com divergência, corrija o valor e chame de novo.
 
 ESTILO
 Frases curtas. Voz ativa. Sem "é importante notar", sem "vale destacar", sem
 listas de três por hábito. Se não sabe, diga que não sabe.`;
 
 /**
- * Schema NAO-strict de proposito.
- *
- * Ele usa `additionalProperties: false` e nulos por uniao, que sao as marcas de
- * structured outputs -- mas ligar `strict: true` aqui QUEBRARIA com 400: em
- * strict, toda propriedade precisa estar em `required` (e `alerta`,
- * `responsavel_nome`, `esforco_horas` e `memoria_id` nao estao), e
- * `minimum`/`maximum` nao sao suportados. Nao ligue sem reescrever o schema.
+ * Schema NAO-strict de proposito. Ligar `strict: true` QUEBRARIA com 400: em
+ * strict toda propriedade precisa estar em `required` (e `alerta`,
+ * `responsavel_nome`, `esforco_horas` e `memoria_id` nao estao) e
+ * `minimum`/`maximum` nao sao suportados.
  */
-const FERRAMENTAS = [
-  {
-    type: 'function',
-    function: {
-      name: 'listar_paineis',
-      description: 'Lista os painéis disponíveis e o que cada um responde.',
-      parameters: { type: 'object', properties: {}, additionalProperties: false },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'ler_painel',
-      description:
-        'Devolve os números já calculados de um painel: indicadores, séries, filtros ativos, frescor e regras herdadas.',
-      parameters: {
-        type: 'object',
-        properties: { slug: { type: 'string', description: 'Identificador do painel.' } },
-        required: ['slug'],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'listar_equipe',
-      description:
-        'Colaboradores ativos da FMP (nome, cargo, área) para atribuir responsável. Não inclui alunos.',
-      parameters: { type: 'object', properties: {}, additionalProperties: false },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'propor_plano',
-      description:
-        'Entrega o plano estruturado para a tela. NÃO salva e NÃO envia nada — a pessoa revisa e decide.',
-      parameters: {
-        type: 'object',
-        properties: {
-          titulo: { type: 'string' },
-          resumo: {
-            type: 'string',
-            description: 'UMA frase, em linguagem falada, dizendo o que chamou atenção. Abre a tela.',
-          },
-          alerta: {
-            type: 'string',
-            description: 'Ressalva honesta (carga parada, amostra fraca). Vazio se não houver.',
-          },
-          acoes: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                titulo: { type: 'string' },
-                descricao: { type: 'string' },
-                area: { type: 'string' },
-                responsavel_nome: { type: 'string' },
-                janela: { type: 'string', enum: ['esta_semana', 'proximas_semanas', 'quando_der'] },
-                esforco_horas: { type: 'number' },
-                evidencia: {
-                  type: 'object',
-                  properties: {
-                    dashboard: { type: 'string' },
-                    indicador: { type: 'string' },
-                    valor: { type: ['number', 'null'] },
-                  },
-                  required: ['dashboard', 'indicador', 'valor'],
-                  additionalProperties: false,
+const FERRAMENTA_PLANO = {
+  type: 'function',
+  function: {
+    name: 'propor_plano',
+    description:
+      'Entrega o plano estruturado para a tela. NÃO salva e NÃO envia nada — a pessoa revisa e decide.',
+    parameters: {
+      type: 'object',
+      properties: {
+        titulo: { type: 'string' },
+        resumo: {
+          type: 'string',
+          description: 'UMA frase, em linguagem falada, dizendo o que chamou atenção. Abre a tela.',
+        },
+        alerta: {
+          type: 'string',
+          description: 'Ressalva honesta (carga parada, amostra fraca). Vazio se não houver.',
+        },
+        acoes: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              titulo: { type: 'string' },
+              descricao: { type: 'string' },
+              area: { type: 'string' },
+              responsavel_nome: { type: 'string' },
+              janela: { type: 'string', enum: ['esta_semana', 'proximas_semanas', 'quando_der'] },
+              esforco_horas: { type: 'number' },
+              evidencia: {
+                type: 'object',
+                properties: {
+                  dashboard: { type: 'string' },
+                  indicador: { type: 'string' },
+                  valor: { type: ['number', 'null'] },
                 },
-                memoria_id: {
-                  type: ['string', 'null'],
-                  description: 'Preencha quando a ação nasceu de uma memória, não de um número.',
-                },
+                required: ['dashboard', 'indicador', 'valor'],
+                additionalProperties: false,
               },
-              required: ['titulo', 'descricao', 'area', 'janela', 'evidencia'],
-              additionalProperties: false,
+              memoria_id: {
+                type: ['string', 'null'],
+                description: 'Preencha quando a ação nasceu de uma memória, não de um número.',
+              },
             },
+            required: ['titulo', 'descricao', 'area', 'janela', 'evidencia'],
+            additionalProperties: false,
           },
         },
-        required: ['titulo', 'resumo', 'acoes'],
-        additionalProperties: false,
       },
+      required: ['titulo', 'resumo', 'acoes'],
+      additionalProperties: false,
     },
   },
-  {
-    type: 'function',
-    function: {
-      name: 'propor_memoria',
-      description:
-        'Propõe guardar um contexto que a pessoa ensinou. NÃO grava: devolve para ela confirmar, editar ou descartar.',
-      parameters: {
-        type: 'object',
-        properties: {
-          tipo: {
-            type: 'string',
-            enum: ['sazonalidade', 'processo', 'hierarquia', 'correcao', 'licao_aprendida', 'restricao', 'glossario'],
-          },
-          conteudo: { type: 'string', description: 'A frase, curta, como a pessoa ensinou.' },
-          dashboard_slug: { type: ['string', 'null'] },
-          produto: { type: ['string', 'null'] },
-          indicador: { type: ['string', 'null'] },
-          area: { type: ['string', 'null'] },
-          meses: {
-            type: ['array', 'null'],
-            items: { type: 'integer' },
-            description: 'Só para sazonalidade recorrente: números de 1 a 12.',
-          },
-          vigente_ate: {
-            type: ['string', 'null'],
-            description: 'AAAA-MM-DD quando for circunstancial (licença, congelamento).',
-          },
+} as const;
+
+const FERRAMENTA_MEMORIA = {
+  type: 'function',
+  function: {
+    name: 'propor_memoria',
+    description:
+      'Propõe guardar um contexto que a pessoa ensinou. NÃO grava: devolve para ela confirmar, editar ou descartar.',
+    parameters: {
+      type: 'object',
+      properties: {
+        tipo: {
+          type: 'string',
+          enum: ['sazonalidade', 'processo', 'hierarquia', 'correcao', 'licao_aprendida', 'restricao', 'glossario'],
         },
-        required: ['tipo', 'conteudo'],
-        additionalProperties: false,
+        conteudo: { type: 'string', description: 'A frase, curta, como a pessoa ensinou.' },
+        dashboard_slug: { type: ['string', 'null'] },
+        produto: { type: ['string', 'null'] },
+        indicador: { type: ['string', 'null'] },
+        area: { type: ['string', 'null'] },
+        meses: {
+          type: ['array', 'null'],
+          items: { type: 'integer' },
+          description: 'Só para sazonalidade recorrente: números de 1 a 12.',
+        },
+        vigente_ate: {
+          type: ['string', 'null'],
+          description: 'AAAA-MM-DD quando for circunstancial (licença, congelamento).',
+        },
       },
+      required: ['tipo', 'conteudo'],
+      additionalProperties: false,
     },
   },
-] as const;
+} as const;
+
+/** Só existe quando há mais de um painel na conversa. Com um só, seria um convite a rodar em círculo. */
+const FERRAMENTA_OUTRO_PAINEL = {
+  type: 'function',
+  function: {
+    name: 'ler_outro_painel',
+    description:
+      'Números de OUTRO painel, quando a pergunta sair do painel aberto. O painel aberto você já recebeu.',
+    parameters: {
+      type: 'object',
+      properties: { slug: { type: 'string' } },
+      required: ['slug'],
+      additionalProperties: false,
+    },
+  },
+} as const;
 
 const JANELAS_VALIDAS = new Set(['esta_semana', 'proximas_semanas', 'quando_der']);
 
@@ -319,12 +271,11 @@ type Falha = { indicador: string; recebido: number | null; esperado: number | nu
 
 /**
  * Guarda de numeros: rejeita plano que cite numero fora do snapshot.
- *
  * Tolerancia relativa de 0,5% -- o modelo reescreve o valor como texto e pode
  * perder digito. Diferenca maior que isso e outro numero, nao arredondamento.
  */
 function validaEvidencias(
-  plano: { acoes?: Array<{ titulo?: string; evidencia?: { dashboard?: string; indicador?: string; valor?: number | null } }> },
+  plano: { acoes?: Array<{ evidencia?: { dashboard?: string; indicador?: string; valor?: number | null } }> },
   snapshots: Record<string, Snapshot>,
 ): Falha[] {
   const falhas: Falha[] = [];
@@ -352,21 +303,69 @@ function validaEvidencias(
   return falhas;
 }
 
-async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknown>> {
+/** O painel em texto, para ir direto no prompt em vez de virar chamada de ferramenta. */
+function descreveSnapshot(s: Snapshot): string {
+  const ind = s.indicadores
+    .map((i) => {
+      const valor = i.valor === null ? 'sem dado' : String(i.valor);
+      const extras = [
+        i.unidade,
+        i.amostraPequena ? 'AMOSTRA PEQUENA — não sustenta decisão' : '',
+        i.glossario ?? '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return `  - ${i.chave} ("${i.rotulo}") = ${valor}  [${extras}]`;
+    })
+    .join('\n');
+
+  const series = s.series
+    .map((se) => {
+      const pontos = se.pontos.map((p) => `${p.r}: ${p.v ?? '—'}`).join(' | ');
+      return `  - ${se.rotulo}${se.truncadaEm ? ` (top ${se.truncadaEm})` : ''}: ${pontos}`;
+    })
+    .join('\n');
+
+  return [
+    `PAINEL: ${s.titulo} (use "${s.slug}" no campo dashboard da evidência)`,
+    `RECORTE: ${s.recorte.descricao}`,
+    '',
+    'INDICADORES — use a chave à esquerda e o valor exato:',
+    ind || '  (nenhum)',
+    '',
+    'SÉRIES:',
+    series || '  (nenhuma)',
+    '',
+    'ATUALIZAÇÃO DAS FONTES:',
+    s.frescor.map((f) => `  - ${f.fonte}: ${f.sinal}${f.alerta ? '  ⚠ ATRASADA' : ''}`).join('\n') || '  (sem sinal)',
+    '',
+    'REGRAS HERDADAS DO POWER BI (leia antes de apontar anomalia):',
+    s.observacoes.map((o) => `  - ${o}`).join('\n') || '  (nenhuma)',
+  ].join('\n');
+}
+
+async function chamaLLM(
+  mensagens: MensagemLLM[],
+  ferramentas: readonly unknown[],
+  forcarTexto: boolean,
+): Promise<Record<string, unknown>> {
   if (!OPENAI_KEY) {
-    throw new Error(
-      'LLM não configurada nesta função. Cadastre OPENAI_API_KEY nos Secrets das Edge Functions.',
-    );
+    throw new Error('LLM não configurada nesta função. Cadastre OPENAI_API_KEY nos Secrets das Edge Functions.');
   }
 
   const corpo: Record<string, unknown> = {
     model: OPENAI_MODEL,
     messages: mensagens,
-    tools: FERRAMENTAS,
-    tool_choice: 'auto',
     // `max_tokens` e `temperature` NAO entram: os modelos atuais recusam os dois.
     max_completion_tokens: TETO_SAIDA,
   };
+  if (forcarTexto) {
+    // Ultima volta: sem ferramenta nenhuma, o modelo e obrigado a escrever.
+    corpo.tool_choice = 'none';
+  } else {
+    corpo.tools = ferramentas;
+    corpo.tool_choice = 'auto';
+  }
   if (ENVIA_REASONING) corpo.reasoning_effort = REASONING;
 
   let resposta: Response;
@@ -378,8 +377,6 @@ async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknow
       signal: AbortSignal.timeout(TIMEOUT_CHAMADA_MS),
     });
   } catch (err) {
-    // Sem isto, um travamento da OpenAI vira 546 sem corpo -- erro de CORS na
-    // tela do usuario, e nenhuma pista de onde olhar.
     const nome = err instanceof Error ? err.name : '';
     if (nome === 'TimeoutError' || nome === 'AbortError') {
       throw new Error('A LLM demorou demais para responder. Tente de novo.');
@@ -388,8 +385,7 @@ async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknow
   }
 
   if (!resposta.ok) {
-    // Le SO o objeto `error` da resposta -- nunca o corpo que enviamos, que
-    // carrega trecho do snapshot. Cortado em 300 caracteres.
+    // Le SO o objeto `error` da resposta -- nunca o corpo que enviamos.
     let detalhe = '';
     try {
       const erroApi = (await resposta.json()) as { error?: { message?: string; code?: string } };
@@ -417,9 +413,8 @@ Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS });
   if (req.method !== 'POST') return json({ erro: 'Método não suportado.' }, 405);
 
-  // try/catch externo: sem ele, qualquer excecao inesperada sobe como 500 SEM
-  // os cabecalhos de CORS, e o navegador reporta erro de CORS em vez da
-  // mensagem -- diagnostico ruim justamente na hora ruim.
+  // try/catch externo: sem ele, uma excecao inesperada sobe como 500 SEM os
+  // cabecalhos de CORS, e o navegador reporta erro de CORS em vez da mensagem.
   try {
     const token = (req.headers.get('Authorization') ?? '').replace(/^Bearer\s+/i, '');
     if (!token) return json({ erro: 'Sessão ausente.' }, 401);
@@ -463,9 +458,7 @@ Deno.serve(async (req: Request) => {
     const snapAtivo = snapshots[slugAtivo];
     if (!snapAtivo) return json({ erro: 'Nenhum painel foi enviado para leitura.' }, 400);
 
-    // ---- teto de uso, POR USUARIO -------------------------------------
-    // Janela de 24h corridas em vez de "dia civil": o runtime roda em UTC, e um
-    // teto que zera 21h no horario de Brasilia confunde mais do que protege.
+    // ---- teto de uso, POR USUARIO, em 24h corridas ---------------------
     const desde = new Date(Date.now() - 86_400_000).toISOString();
     const { data: minhasConversas } = await admin
       .schema('plano')
@@ -486,15 +479,19 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // ---- memoria no escopo --------------------------------------------
-    const { data: memorias } = await admin.rpc('plano_memoria_no_escopo', {
-      p_dashboard: slugAtivo,
-      p_produto: snapAtivo.recorte.produto ?? null,
-      p_indicadores: snapAtivo.indicadores.map((i) => i.chave),
-      p_areas: null,
-      p_mes: snapAtivo.recorte.mesReferencia ?? null,
-    });
-    const memoriaLista = (memorias ?? []) as Memoria[];
+    // ---- memoria e equipe, em paralelo ---------------------------------
+    const [resMemoria, resEquipe] = await Promise.all([
+      admin.rpc('plano_memoria_no_escopo', {
+        p_dashboard: slugAtivo,
+        p_produto: snapAtivo.recorte.produto ?? null,
+        p_indicadores: snapAtivo.indicadores.map((i) => i.chave),
+        p_areas: null,
+        p_mes: snapAtivo.recorte.mesReferencia ?? null,
+      }),
+      admin.rpc('equipe'),
+    ]);
+    const memoriaLista = (resMemoria.data ?? []) as Memoria[];
+    const equipe = (resEquipe.data ?? []) as Colega[];
 
     // ---- historico -----------------------------------------------------
     let conversaId = typeof corpo.conversa_id === 'string' ? corpo.conversa_id : null;
@@ -537,15 +534,27 @@ Deno.serve(async (req: Request) => {
           .join('\n')}`
       : 'A equipe ainda não te ensinou nada que se aplique a este recorte.';
 
+    const blocoEquipe = equipe.length
+      ? `Equipe da FMP (atribua o responsável usando o nome exato):\n${equipe
+          .map((c) => `- ${c.nome_completo}${c.cargo ? ` — ${c.cargo}` : ''}${c.area ? ` (${c.area})` : ''}`)
+          .join('\n')}`
+      : 'A equipe ainda não tem áreas cadastradas; deixe o responsável em branco.';
+
+    const outrosPaineis = Object.keys(snapshots).filter((s) => s !== slugAtivo);
+    const ferramentas = outrosPaineis.length
+      ? ([FERRAMENTA_PLANO, FERRAMENTA_MEMORIA, FERRAMENTA_OUTRO_PAINEL] as const)
+      : ([FERRAMENTA_PLANO, FERRAMENTA_MEMORIA] as const);
+
     const mensagens: MensagemLLM[] = [
       { role: 'system', content: SISTEMA },
       {
         role: 'system',
         content:
           `Hoje é ${new Date().toLocaleDateString('pt-BR')}. Quem fala com você é ${perfil.nome_completo}.\n\n` +
-          `Painel aberto agora: ${snapAtivo.titulo} (${slugAtivo}), recorte "${snapAtivo.recorte.descricao}".\n` +
-          `Use ler_painel para ver os números. Painéis disponíveis: ${Object.keys(snapshots).join(', ')}.\n\n` +
-          blocoMemoria,
+          `${descreveSnapshot(snapAtivo)}\n\n${blocoEquipe}\n\n${blocoMemoria}` +
+          (outrosPaineis.length
+            ? `\n\nOutros painéis disponíveis por ler_outro_painel: ${outrosPaineis.join(', ')}.`
+            : ''),
       },
       ...historico,
       { role: 'user', content: mensagem },
@@ -559,12 +568,18 @@ Deno.serve(async (req: Request) => {
     const prazo = Date.now() + PRAZO_TOTAL_MS;
 
     for (let volta = 0; volta < MAX_VOLTAS; volta++) {
-      if (Date.now() > prazo) break;
+      const semTempo = Date.now() > prazo;
+      // Na ultima volta (ou sem tempo) o modelo perde as ferramentas e precisa
+      // escrever. Sem isso, ele podia terminar chamando ferramenta e a resposta
+      // saia vazia -- indistinguivel de "nao respondeu".
+      const forcarTexto = semTempo || volta === MAX_VOLTAS - 1;
 
       let resposta: Record<string, unknown>;
       try {
-        resposta = await chamaLLM(mensagens);
+        resposta = await chamaLLM(mensagens, ferramentas, forcarTexto);
       } catch (err) {
+        // Ja temos plano? Entrega o que ha, em vez de perder o turno inteiro.
+        if (planoProposto) break;
         return json({ erro: err instanceof Error ? err.message : 'Falha no assistente.' }, 502);
       }
 
@@ -572,19 +587,19 @@ Deno.serve(async (req: Request) => {
       const msg = escolha?.message as MensagemLLM | undefined;
       if (!msg) return json({ erro: 'Resposta vazia do assistente.' }, 502);
 
-      // Truncamento e checado ANTES de olhar as tool calls. Quando o corte cai
-      // dentro de `function.arguments`, o JSON quebra, os argumentos viram {} e
-      // um plano VAZIO seria aceito como valido -- o "fallback silencioso" que
-      // a guarda de numeros existe justamente para impedir.
-      if (escolha?.finish_reason === 'length') {
-        return json(
-          { erro: 'O assistente ficou sem espaço para responder. Peça um plano mais curto.' },
-          502,
-        );
+      // Truncamento e checado ANTES das tool calls: quando o corte cai dentro
+      // de `function.arguments`, o JSON quebra, os argumentos viram {} e um
+      // plano VAZIO passaria pela guarda de numeros como valido.
+      if (escolha?.finish_reason === 'length' && !planoProposto) {
+        return json({ erro: 'O assistente ficou sem espaço para responder. Peça um plano mais curto.' }, 502);
       }
 
       mensagens.push(msg);
       const chamadas = msg.tool_calls ?? [];
+      // Diagnostico sem PII: e o que faltou nas falhas anteriores.
+      console.log(
+        `[plano-agente] volta ${volta}: ${chamadas.length ? chamadas.map((c) => c.function.name).join(',') : 'texto'}`,
+      );
 
       if (chamadas.length === 0) {
         textoFinal = msg.content ?? '';
@@ -597,8 +612,6 @@ Deno.serve(async (req: Request) => {
         try {
           args = JSON.parse(chamada.function.arguments || '{}');
         } catch {
-          // Devolve o erro AO MODELO para ele reenviar, em vez de seguir com
-          // argumentos vazios fingindo que deu certo.
           mensagens.push({
             role: 'tool',
             tool_call_id: chamada.id,
@@ -608,32 +621,20 @@ Deno.serve(async (req: Request) => {
         }
         let resultado: unknown;
 
-        if (nome === 'listar_paineis') {
-          resultado = Object.values(snapshots).map((s) => ({
-            slug: s.slug,
-            titulo: s.titulo,
-            recorte: s.recorte.descricao,
-          }));
-        } else if (nome === 'ler_painel') {
-          // Resolve do payload que o cliente mandou. A funcao NUNCA consulta
-          // tabela de negocio: a regra de calculo vive no navegador, e
-          // recalcular aqui daria numero diferente do que esta na tela.
+        if (nome === 'ler_outro_painel') {
           const s = snapshots[String(args.slug ?? '')];
           resultado = s ?? { erro: 'Painel não disponível nesta conversa.' };
-        } else if (nome === 'listar_equipe') {
-          const { data } = await admin.rpc('equipe');
-          resultado = data ?? [];
         } else if (nome === 'propor_plano') {
-          const falhas = validaEvidencias(args as never, snapshots);
           // `janela` fora do enum quebraria o agrupamento da tela. O schema
           // nao-strict nao garante isso do lado da OpenAI -- garantimos aqui.
           for (const a of (args.acoes as Array<{ janela?: string }> | undefined) ?? []) {
             if (!JANELAS_VALIDAS.has(String(a.janela))) a.janela = 'proximas_semanas';
           }
+          const falhas = validaEvidencias(args as never, snapshots);
           if (falhas.length > 0) {
             resultado = {
               aceito: false,
-              erro: 'Números divergentes do painel. Corrija usando exatamente o valor do indicador.',
+              erro: 'Números divergentes. Use exatamente o valor do indicador, na chave indicada em `esperado`.',
               divergencias: falhas,
             };
           } else {
@@ -659,11 +660,10 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // Sair do laco sem NADA e indistinguivel de "nao respondeu" na tela -- o
-    // sintoma mais caro de diagnosticar. Melhor dizer o que aconteceu.
     if (!textoFinal && !planoProposto && !memoriaProposta) {
+      console.error('[plano-agente] laço terminou sem plano e sem texto');
       return json(
-        { erro: 'O assistente se perdeu consultando os painéis e não chegou a um plano. Reformule o pedido.' },
+        { erro: 'O assistente não chegou a um plano desta vez. Tente de novo ou reformule o pedido.' },
         502,
       );
     }
@@ -692,11 +692,7 @@ Deno.serve(async (req: Request) => {
       resposta: textoFinal,
       plano: planoProposto,
       memoria_proposta: memoriaProposta,
-      memorias_consideradas: memoriaLista.map((m) => ({
-        id: m.id,
-        conteudo: m.conteudo,
-        tipo: m.tipo,
-      })),
+      memorias_consideradas: memoriaLista.map((m) => ({ id: m.id, conteudo: m.conteudo, tipo: m.tipo })),
     });
   } catch (err) {
     console.error('[plano-agente] falha inesperada:', err instanceof Error ? err.message : err);
