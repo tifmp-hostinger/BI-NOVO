@@ -4,9 +4,10 @@ Documento de decisão para o módulo **Plano de Ação** da FMP Analytics.
 Escrito no formato de contrato do `SPECS.md`: **DEVE / NUNCA** são regras duras,
 **DECISÃO** resolve um ponto em aberto, **PADRÃO** é convenção herdada.
 
-Premissas confirmadas: LLM **Azure OpenAI / OpenAI**, comunicação por
-**n8n/Make → Microsoft Teams**, autonomia **sugere e humano aprova**, primeira
-entrega **MVP sobre um dashboard** (`growth-e-performance`).
+Premissas confirmadas (atualizadas em 06/08/2026): LLM **OpenAI direto**
+(chave de API, sem Azure OpenAI), comunicação por **Power Automate → Microsoft
+Teams** — o Azure entra só como casa do Teams —, autonomia **sugere e humano
+aprova**, primeira entrega **MVP sobre um dashboard** (`growth-e-performance`).
 
 ---
 
@@ -59,10 +60,10 @@ flowchart TB
   end
 
   P -->|JWT + snapshot| A
-  A -->|Azure OpenAI| LLM["Azure OpenAI"]
+  A -->|chave de API| LLM["OpenAI"]
   A --> T1 & T2 & T3
   P -->|só após aprovação| C
-  C --> N8N["n8n / Make"] --> TEAMS["Microsoft Teams"]
+  C --> PA["Power Automate"] --> TEAMS["Microsoft Teams"]
   C --> T4
 ```
 
@@ -71,7 +72,7 @@ Quatro camadas, cada uma com uma responsabilidade única:
 1. **Leitura** — `snapshot.ts` por dashboard (front).
 2. **Raciocínio** — Edge Function `plano-agente` (chave da LLM fica no servidor).
 3. **Persistência** — schema `plano` no Postgres, com RLS.
-4. **Comunicação** — Edge Function `plano-comunicar` → n8n → Teams.
+4. **Comunicação** — Edge Function `plano-comunicar` → Power Automate → Teams.
 
 ---
 
@@ -542,18 +543,54 @@ Ninguém ensina uma máquina duas vezes se não vê retorno.
 
 ## 6. Camada 4 — Comunicação
 
-### 6.1 n8n na frente do Teams
+### 6.1 O webhook clássico do Teams não existe mais
 
-**DECISÃO**: a aplicação conhece **um** webhook — o do n8n. O n8n decide destino,
-formata *Adaptive Card* do Teams, faz retry, resolve quem recebe o quê e
-eventualmente também dispara e-mail ou WhatsApp. Trocar canal vira configuração
-no n8n, não deploy da aplicação.
+**FATO, conferido em 06/08/2026**: os *Office 365 connectors* do Microsoft Teams
+— o "Incoming Webhook" que se criava dentro do canal — foram **desligados entre
+18 e 22 de maio de 2026**. URL de connector não entrega mais nada. O substituto
+oficial da Microsoft é **Power Automate Workflows**.
 
-**NUNCA** colocar a URL do webhook (n8n ou Teams) em `VITE_*`. Ela iria para o
-bundle público e qualquer visitante poderia inundar o canal do time. É *secret*
-da Edge Function, sempre.
+Isto invalida o desenho anterior deste documento, que assumia um incoming
+webhook de canal. Registrado aqui em vez de corrigido em silêncio.
 
-### 6.2 Envelope
+### 6.2 O desenho atual
+
+```
+plano-comunicar (Edge Function)
+        │  POST envelope v1 + X-FMP-Assinatura
+        ▼
+Power Automate — gatilho "When a Teams webhook request is received"
+        │
+        ├─▶ mensagem direta para cada responsável (só as ações dele)
+        └─▶ Adaptive Card de resumo no canal da área
+```
+
+**DECISÃO**: a aplicação conhece **uma** URL de webhook, guardada em
+`PLANO_WEBHOOK_URL`. Quem está do outro lado — Power Automate hoje, n8n amanhã —
+é irrelevante para o código: o envelope é o mesmo. Isso mantém a porta aberta
+para e-mail e WhatsApp sem tocar na aplicação.
+
+Por que Power Automate e não o Microsoft Graph: Graph exigiria registro de
+aplicativo no Entra ID, consentimento de administrador e renovação de token
+dentro da Edge Function. O fluxo do Power Automate é montado na interface do
+próprio Teams pela TI, e a Edge Function só faz um POST.
+
+- **NUNCA** colocar a URL do webhook em `VITE_*`. Ela iria para o bundle público
+  e qualquer visitante poderia inundar o canal do time. É *secret* da Edge
+  Function, sempre.
+- A URL do gatilho do Power Automate **autentica por posse**: quem tem o
+  endereço, publica. Por isso a Edge Function **DEVE** enviar um cabeçalho
+  `X-FMP-Assinatura` com segredo compartilhado, e o fluxo **DEVE** ter uma
+  condição no primeiro passo que descarta o que não bate. Sem isso, uma URL
+  vazada vira spam no canal da instituição.
+- O envelope **DEVE** levar `responsavel_email` (de `perfis.email_contato`) — o
+  Power Automate precisa disso para resolver a pessoa e mandar a mensagem
+  direta. É e-mail de colaborador, não de aluno: §13 não se aplica, e ele nunca
+  é renderizado na tela, só trafega servidor a servidor.
+- *Adaptive Card*, nunca *MessageCard*: o formato antigo perdeu o suporte a
+  cartão interativo junto com os connectors.
+
+### 6.3 Envelope
 
 Payload estável e versionado, para o n8n não quebrar a cada mudança da tela:
 
@@ -573,7 +610,7 @@ Payload estável e versionado, para o n8n não quebrar a cada mudança da tela:
 }
 ```
 
-### 6.3 Fluxo de aprovação (autonomia escolhida)
+### 6.4 Fluxo de aprovação (autonomia escolhida)
 
 ```
 rascunho ──[gestor edita/aceita]──▶ em_revisao ──[admin aprova]──▶ aprovado
@@ -784,7 +821,8 @@ convence — e você gastou uma sprint, não um trimestre.
 tela com plano por área, responsáveis, prazos e aprovação.
 
 **Fase 2 — Comunicação**
-`plano-comunicar` → n8n → Adaptive Card no Teams + `plano.envios` + idempotência.
+`plano-comunicar` → Power Automate → mensagem direta por responsável e Adaptive
+Card no canal + `plano.envios` + idempotência.
 
 **Fase 3 — Memória e acompanhamento**
 `plano.memoria` com fluxo proposta/validação, `buscar_memoria` no agente, status

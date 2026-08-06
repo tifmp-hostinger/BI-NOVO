@@ -36,7 +36,11 @@ const AZURE_KEY = Deno.env.get('AZURE_OPENAI_KEY') ?? '';
 const AZURE_DEPLOYMENT = Deno.env.get('AZURE_OPENAI_DEPLOYMENT') ?? '';
 const AZURE_API_VERSION = Deno.env.get('AZURE_OPENAI_API_VERSION') ?? '2024-10-21';
 const OPENAI_KEY = Deno.env.get('OPENAI_API_KEY') ?? '';
-const OPENAI_MODEL = Deno.env.get('OPENAI_MODEL') ?? 'gpt-4.1';
+// Conferido no catalogo da OpenAI em 06/08/2026: `gpt-5.6` e o modelo geral e
+// `gpt-5.6-terra` a opcao mais barata. Modelo e coisa que muda de nome sozinha
+// -- por isso `OPENAI_MODEL` deve ser cadastrado explicitamente no deploy, e
+// este padrao serve so para nao quebrar quem esquecer.
+const OPENAI_MODEL = Deno.env.get('OPENAI_MODEL') ?? 'gpt-5.6';
 
 /** Teto por usuario/dia. Conta de LLM sem teto vira surpresa no fim do mes. */
 const LIMITE_TURNOS_DIA = 40;
@@ -337,6 +341,16 @@ async function chamaLLM(mensagens: MensagemLLM[]): Promise<Record<string, unknow
   if (!resposta.ok) {
     // NUNCA logar o corpo: pode conter trecho do prompt com dado interno.
     console.error(`[plano-agente] LLM respondeu ${resposta.status}`);
+    // 400/404 quase sempre e nome de modelo errado ou deployment inexistente.
+    // Sem esta dica o operador ve "nao respondeu" e vai procurar no lugar errado.
+    if (resposta.status === 400 || resposta.status === 404) {
+      throw new Error(
+        'A LLM recusou a chamada. Confira o segredo OPENAI_MODEL (ou AZURE_OPENAI_DEPLOYMENT) — o nome do modelo provavelmente não existe.',
+      );
+    }
+    if (resposta.status === 401 || resposta.status === 403) {
+      throw new Error('A chave da LLM foi recusada. Confira o segredo OPENAI_API_KEY.');
+    }
     throw new Error('O assistente não respondeu. Tente de novo em instantes.');
   }
   return (await resposta.json()) as Record<string, unknown>;
